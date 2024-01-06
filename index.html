@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head>
+    <title>漢語字典</title>
+    <meta charset="utf-8">
+  </head>
+  <body>
+    <input id='input' placeholder='' oninput='update()' style='width: 99%;'></input> 
+    <h1 id='char' style="font-weight: bold"></h1>
+    <h2 id='py' style="font-weight: bold"></h2>
+
+<script src="https://fastly.jsdelivr.net/npm/cnchar/cnchar.min.js"></script>
+<script src="https://fastly.jsdelivr.net/npm/cnchar-poly/cnchar.poly.min.js"></script>
+<script src="https://fastly.jsdelivr.net/npm/cnchar-draw/cnchar.draw.min.js"></script
+
+<!--... 其他插件请参考第二章 2. 功能及插件概览-->
+
+    <script src='char_detail.js'></script>    
+    <script src='script.js'></script>
+    <div id='drawStroke'></div>
+  </body>
+</html>
