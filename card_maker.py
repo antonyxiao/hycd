@@ -1,40 +1,40 @@
 import genanki
 import json
 import pycantonese
+import chinese_converter
 import csv
-
-with open('xhzd.csv', newline='') as csvfile:
-
-    spamreader = csv.reader(csvfile, delimiter=',')
-
-    i = 0
-
-    for row in spamreader:
-        i += 1
-        print(row[0])
-        
 
 # Create a new Anki deck with a unique ID and a name
 my_deck = genanki.Deck(
-  deck_id=123456789,
-  name="idoms",
+  deck_id=123456790,
+  name="hanzi",
 )
 
+answer_side = """{{FrontSide}}<hr id='answer'>
+    {{Pinyin}}<br>
+    {{Jyutping}}<br><br>
+    {{Definition}}<br><br>
+    {{Stroke}} {{Level}} {{Page}}
+    """
 # Define a model (template) for the cards
 # A model specifies the fields and card format
 my_model = genanki.Model(
-  model_id=123456789,
+  model_id=123456790,
   name="Basic Model",
   fields=[
-    {"name": "Question"},
-    {"name": "Answer"},
+    {"name": "Character"},
+    {"name": "Pinyin"},
+    {"name": "Jyutping"},
+    {"name": "Definition"},
+    {"name": "Stroke"},
+    {"name": "Level"},
+    {"name": "Page"},
     #{"name": "image"},
-  ],
-  templates=[
+  ],templates=[
     {
       "name": "Card 1",
-      "qfmt": "{{Question}}", # Question format
-      "afmt": "{{FrontSide}}<hr id='answer'>{{Answer}}", # Answer format
+      "qfmt": "<span class='char'>{{Character}}</span>", # Question format
+      "afmt": answer_side, # Answer format
       #"afmt": "{{FrontSide}}<hr id='answer'>{{Answer}}<br>{{image}}", # Answer format
     },
   ],
@@ -46,22 +46,39 @@ my_model = genanki.Model(
    color: black;
    background-color: white;
   }
-  """,
+
+  .char {
+    font-size: 200%;
+  }
+  """
 )
 
-f = open('idiom.json',)
-data = json.load(f)
 
-for entry in data:
-    # Add a card to the deck
-    note = genanki.Note(
-      model=my_model,
-      fields=[]
-      #fields=["What is the capital of France?", "Paris",'<img src="image.gif">'],
-    )
+with open('xhzd.csv', newline='', encoding='utf-8') as csvfile:
 
-    # add note to deck
-    my_deck.add_note(note)
+    spamreader = csv.reader(csvfile, delimiter=',')
+
+    for row in spamreader:
+        
+        # Generate jyutping for the word, filtering out None values
+        jyutping_chunks = [
+            chunk[1] for chunk in pycantonese.characters_to_jyutping(chinese_converter.to_traditional(row[0][0]))
+            if chunk[1] is not None
+        ]
+        jyutping = ' '.join(jyutping_chunks)
+
+        # Add a space after each number in the Jyutping string
+        jyutping = ''.join(char + ' ' if char.isdigit() else char for char in jyutping).strip()
+
+
+
+        # Add a card to the deck
+        note = genanki.Note(
+            model=my_model,
+            fields=[row[0], row[3], jyutping, row[6], row[5], row[4], row[1] + "页"] #fields=["What is the capital of France?", "Paris",'<img src="image.gif">'],) # add note to deck my_deck.add_note(note)
+        )
+        
+        my_deck.add_note(note)
 
 # create package for deck
 my_package = genanki.Package(my_deck)
@@ -70,6 +87,6 @@ my_package = genanki.Package(my_deck)
 #my_package.media_files = ['image.gif']
 
 # Save the deck to a file
-my_package.write_to_file('idoms.apkg')
+my_package.write_to_file('hanzi.apkg')
 
 print("Deck has been created.")
