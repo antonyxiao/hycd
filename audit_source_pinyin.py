@@ -70,8 +70,10 @@ def parse_pinyin_info(pinyin_str):
 def main():
     cedict = load_cedict()
     
-    print("Auditing XHZD Pinyin (Smart Match)...")
-    mismatches = []
+    print("Auditing XHZD Pinyin (Character-level check)...")
+    
+    # Group XHZD entries by character
+    xhzd_entries = {} # char -> list of {line, pinyin}
     
     with open(XHZD_FILE, 'r', encoding='utf-8') as f:
         reader = csv.reader(f)
@@ -85,45 +87,57 @@ def main():
             match = re.search(r'^(.*?)（.*?）$', char_raw)
             base_char = match.group(1) if match else char_raw
             
-            if base_char in cedict:
-                cedict_pinyins = cedict[base_char]
+            if base_char not in xhzd_entries:
+                xhzd_entries[base_char] = []
+            
+            xhzd_entries[base_char].append({
+                'line': i + 1,
+                'pinyin': pinyin_raw
+            })
+            
+    mismatches = []
+    
+    for char, entries in xhzd_entries.items():
+        if char not in cedict:
+            continue
+            
+        cedict_pinyins = cedict[char]
+        
+        # Check if ANY entry for this char matches ANY cedict pinyin
+        has_any_match = False
+        
+        for entry in entries:
+            xhzd_base, xhzd_tones = parse_pinyin_info(entry['pinyin'])
+            
+            for cp in cedict_pinyins:
+                cedict_base, cedict_tones = parse_pinyin_info(cp)
                 
-                xhzd_base, xhzd_tones = parse_pinyin_info(pinyin_raw)
+                if xhzd_base != cedict_base:
+                    continue
                 
-                match_found = False
-                for cp in cedict_pinyins:
-                    cedict_base, cedict_tones = parse_pinyin_info(cp)
-                    
-                    # Letters must match
-                    if xhzd_base != cedict_base:
-                        continue
-                        
-                    # Tones must match (subset or equal?)
-                    # XHZD might be polyphonic listed as one entry? No, separate entries.
-                    # BUT qiānwǎ has {1, 3}. qian1wa3 has {1, 3}.
-                    # ā has {1}. ai1 has {1}. Mismatch on letters.
-                    
-                    # Tone logic:
-                    # If XHZD has tones, they should match CEDICT tones.
-                    # If XHZD has no tones (neutral), CEDICT might have 5 or nothing.
-                    # If sets are equal, good.
-                    
-                    if xhzd_tones == cedict_tones:
-                        match_found = True
-                        break
-                    
-                    # Allow loose neutral match: empty vs {5}
-                    if not xhzd_tones and cedict_tones == {5}:
-                        match_found = True
-                        break
-                
-                if not match_found:
-                    mismatches.append({
-                        'line': i + 1,
-                        'char': base_char,
-                        'xhzd': pinyin_raw,
-                        'cedict': list(cedict_pinyins)
-                    })
+                # Check tones
+                if xhzd_tones == cedict_tones:
+                    has_any_match = True
+                    break
+                if not xhzd_tones and cedict_tones == {5}:
+                    has_any_match = True
+                    break
+            
+            if has_any_match:
+                break
+        
+        # If NO entry matched, report ALL entries for this char
+        if not has_any_match:
+            for entry in entries:
+                mismatches.append({
+                    'line': entry['line'],
+                    'char': char,
+                    'xhzd': entry['pinyin'],
+                    'cedict': list(cedict_pinyins)
+                })
+    
+    # Sort by line number
+    mismatches.sort(key=lambda x: x['line'])
     
     # Report
     print(f"Found {len(mismatches)} mismatches.")
