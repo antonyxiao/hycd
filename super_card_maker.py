@@ -30,10 +30,11 @@ HINT_CACHE_FILE = 'hint_cache.json'
 LD_CHARSET_FILE = 'ld_charset.csv'
 UNIHAN_FILE = '/home/antony/.gemini/tmp/f9a74935d10281ca610e70c9e3ea1e0dc2d0997b73b4f242f57894b06bd629b0/Unihan_Readings.txt'
 OUTPUT_CSV = 'hanzi_cards_complete.csv'
+PINYIN_SUGGESTIONS_FILE = 'pinyin_suggestions.txt'
 
 # LLM Config
 OPENROUTER_API_KEY = "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"
-USE_LLM = True 
+USE_LLM = False 
 
 # -----------------------------------------------------------------------------
 # DATA LOADING
@@ -188,6 +189,101 @@ def parse_cedict(filepath):
     return cedict_data, cedict_reverse
 
 # -----------------------------------------------------------------------------
+# PINYIN CORRECTION HELPERS
+# -----------------------------------------------------------------------------
+
+# Vowels for tone marking priority
+VOWELS = "aoeiuüv"
+# Maps for tones
+TONE_MARKS = {
+    'a': "āáǎà",
+    'o': "ōóǒò",
+    'e': "ēéěè",
+    'i': "īíǐì",
+    'u': "ūúǔù",
+    'ü': "ǖǘǚǜ",
+    'v': "ǖǘǚǜ"
+}
+
+def numbered_to_marked(pinyin_numbered):
+    """
+    Converts numbered pinyin (e.g. 'ai1', 'lv4', 'da5') to tone marked (e.g. 'āi', 'lǜ', 'da').
+    """
+    if not pinyin_numbered:
+        return ""
+    
+    # Separate syllable and tone
+    match = re.match(r'^([a-zA-Züv]+)(\d)$', pinyin_numbered)
+    if not match:
+        return pinyin_numbered
+    
+    syl = match.group(1).lower()
+    tone = int(match.group(2))
+    
+    if tone == 5 or tone == 0:
+        return syl.replace('v', 'ü')
+    
+    syl = syl.replace('v', 'ü')
+    
+    def replace_char(s, idx, char_with_tone):
+        return s[:idx] + char_with_tone + s[idx+1:]
+        
+    idx_to_mark = -1
+    
+    if 'a' in syl:
+        idx_to_mark = syl.find('a')
+    elif 'e' in syl:
+        idx_to_mark = syl.find('e')
+    elif 'ou' in syl:
+        idx_to_mark = syl.find('o')
+    else:
+        for i in range(len(syl) - 1, -1, -1):
+            if syl[i] in VOWELS:
+                idx_to_mark = i
+                break
+                
+    if idx_to_mark != -1:
+        char = syl[idx_to_mark]
+        if char in TONE_MARKS:
+            marked_char = TONE_MARKS[char][tone - 1]
+            return replace_char(syl, idx_to_mark, marked_char)
+            
+    return pinyin_numbered
+
+def load_pinyin_suggestions(filepath):
+    corrections = {} # 1-based line_num -> new_pinyin_marked
+    if not os.path.exists(filepath):
+        print(f"Warning: Suggestions file '{filepath}' not found. Skipping pinyin corrections.")
+        return corrections
+
+    print(f"Loading Pinyin suggestions from {filepath}...")
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            
+            # Robust parsing for "Line 123: ... Suggestions: ['pinyin1', ...]"
+            match = re.search(r'Line (\d+):.+Suggestions: \[[\'"]([^\'\n]+)[\'"]', line)
+            # print(f"Debug: Line '{line}' match: {match}")
+            if match:
+                line_num = int(match.group(1))
+                best_pinyin_numbered = match.group(2)
+                new_pinyin_marked = numbered_to_marked(best_pinyin_numbered)
+                corrections[line_num] = new_pinyin_marked
+    
+    print(f"Loaded {len(corrections)} pinyin corrections.")
+    return corrections
+
+def apply_pinyin_override(row_index, current_pinyin, corrections):
+    """
+    Overrides the pinyin if a correction exists for this row index.
+    """
+    if row_index in corrections:
+        # print(f"Overriding line {row_index}: {current_pinyin} -> {corrections[row_index]}")
+        return corrections[row_index]
+    return current_pinyin
+
+# -----------------------------------------------------------------------------
 # LLM GENERATION
 # -----------------------------------------------------------------------------
 
@@ -297,7 +393,7 @@ def run_missing_hint_generation(missing_items, cache_file, cache_data):
 def pinyin_marks_to_numbers(pinyin_str):
     # Remove parens and content
     clean = re.sub(r'（.*?）', '', pinyin_str)
-    clean = re.sub(r'\(.*?\)', '', clean)
+    clean = re.sub(r'\(.*\)', '', clean)
     clean = clean.lower().replace('u:', 'v').replace('ü', 'v')
     
     mapping = {
@@ -406,26 +502,96 @@ def get_middle_chinese(candidates, pinyin, english_keywords, baxter_data):
     winners = sorted(list(set([mc for score, mc in possible_mcs if score == best_score])))
     return " / ".join(winners)
 
+def enrich_definition_with_jyutping(definition):
+    """
+    Searches for words in brackets ［word］ followed by pinyin guides （guide）.
+    Looks up the word in pycantonese and appends the Jyutping to the guide.
+    Example: ［舴艋］（–měng） -> ［舴艋］（–měng/-maang5）
+    """
+    if not HAS_NLP:
+        return definition
+        
+    def replacer(match):
+        full_match = match.group(0)
+        word = match.group(1)
+        guide = match.group(2)
+        
+        # Avoid processing if it already has jyutping
+        if '/-' in guide:
+            return full_match
+
+        # Try to convert word to traditional for lookup
+        try:
+            word_trad = HanziConv.toTraditional(word)
+            jp_list = pycantonese.characters_to_jyutping(word_trad)
+            # jp_list is list of (char, jyutping)
+        except:
+            return full_match
+            
+        if len(jp_list) != len(word):
+            return full_match
+            
+        # Detect dash used
+        dash = '–' if '–' in guide else '-' # Prefer em dash if present
+        if dash not in guide:
+            # If no dash, it might be a full pronunciation guide or something else.
+            # We skip complex logic for no-dash cases to avoid errors.
+            return full_match
+            
+        # Assume 2-char word for heuristics as it covers most cases like 驵侩, 舴艋
+        if len(word) == 2:
+            if guide.startswith(dash):
+                # Format: –pinyin (Head is 1st char, pinyin is for 2nd char)
+                pinyin_part = guide[len(dash):].strip()
+                # Target char is the second one (index 1)
+                target_jp = jp_list[1][1]
+                if target_jp:
+                    new_guide = f"{dash}{pinyin_part}/-{target_jp}"
+                    return f"［{word}］（{new_guide}）"
+            elif guide.endswith(dash):
+                # Format: pinyin– (Pinyin is for 1st char, Head is 2nd char)
+                pinyin_part = guide[:-len(dash)].strip()
+                # Target char is the first one (index 0)
+                target_jp = jp_list[0][1]
+                if target_jp:
+                    new_guide = f"{pinyin_part}/-{target_jp}{dash}"
+                    return f"［{word}］（{new_guide}）"
+        
+        return full_match
+
+    # Pattern: ［word］（guide）
+    new_def = re.sub(r'［(.*?)］（(.*?)）', replacer, definition)
+    return new_def
+
 def get_cantonese(char_display, hint_str):
     if not HAS_NLP:
         return ""
     primary_char = re.sub(r'（.*?）', '', char_display).strip()
+    target_char_trad = HanziConv.toTraditional(primary_char)
     
+    # Try to find context-specific Jyutping from hints
     if hint_str and isinstance(hint_str, str):
-        word = hint_str.replace('～', primary_char)
-        try:
-            word_trad = HanziConv.toTraditional(word)
-            target_char_trad = HanziConv.toTraditional(primary_char)
-            jp_list = pycantonese.characters_to_jyutping(word_trad)
-            for ch, jp in jp_list:
-                if ch == target_char_trad and jp:
-                    return jp
-        except:
-            pass
+        # Split hints to process words individually
+        hints = hint_str.split(' / ')
+        for hint in hints:
+            if not hint: continue
+            word = hint.replace('～', primary_char)
+            word = re.sub(r'（.*?）', '', word)
             
+            try:
+                word_trad = HanziConv.toTraditional(word)
+                jp_list = pycantonese.characters_to_jyutping(word_trad)
+                
+                # Check the result for our target character
+                for ch, jp in jp_list:
+                    if ch == target_char_trad and jp:
+                        return jp # Return the first valid context match
+            except:
+                continue
+
+    # Fallback to single character lookup
     try:
-        trad_char = HanziConv.toTraditional(primary_char)
-        jp_list = pycantonese.characters_to_jyutping(trad_char)
+        jp_list = pycantonese.characters_to_jyutping(target_char_trad)
         if jp_list and jp_list[0][1]:
             return jp_list[0][1]
     except:
@@ -540,6 +706,9 @@ def main():
     hint_cache = load_json_cache(HINT_CACHE_FILE)
     unihan_data = load_unihan_data(UNIHAN_FILE)
     
+    # Load Pinyin Corrections
+    pinyin_corrections = load_pinyin_suggestions(PINYIN_SUGGESTIONS_FILE)
+    
     # Build Jyutping Maps from Unihan
     jp_map = collections.defaultdict(set)
     char_jp_counts = collections.defaultdict(set)
@@ -561,11 +730,16 @@ def main():
     
     with open(INPUT_CSV, 'r', encoding='utf-8') as f:
         reader = csv.reader(f)
+        row_index = 0
         for row in reader:
             if len(row) < 7: continue
+            row_index += 1 # 1-based index to match corrections
             
             char_raw = row[0].strip()
             pinyin = row[3].strip()
+            
+            # Apply correction if exists
+            pinyin = apply_pinyin_override(row_index, pinyin, pinyin_corrections)
             
             if char_raw == '字头' or (char_raw == '吖' and '释文' in row[6]):
                 continue
@@ -602,7 +776,7 @@ def main():
                     })
     
     if USE_LLM and items_for_hint_gen:
-        run_missing_hint_generation(items_for_hint_gen, HINT_CACHE_FILE, hint_cache)
+        # run_missing_hint_generation(items_for_hint_gen, HINT_CACHE_FILE, hint_cache)
         hint_cache = load_json_cache(HINT_CACHE_FILE)
         
     print(f"Generating final cards...")
@@ -612,11 +786,17 @@ def main():
     
     with open(INPUT_CSV, 'r', encoding='utf-8') as f:
         reader = csv.reader(f)
+        row_index = 0
         for row in reader:
             if len(row) < 7: continue
+            row_index += 1
             
             char_raw = row[0].strip()
             pinyin = row[3].strip()
+            
+            # Apply correction if exists
+            pinyin = apply_pinyin_override(row_index, pinyin, pinyin_corrections)
+            
             level = row[4].strip()
             raw_def = row[6]
             
@@ -636,7 +816,16 @@ def main():
                 
                 definition = sense['def'].strip().rstrip('；').strip()
                 definition = re.sub(r'另见.*?(?:。|；|$)', '', definition).strip()
+                
+                # Enrich definition with Jyutping info for context words
+                definition = enrich_definition_with_jyutping(definition)
+                
                 hints = sense['hints']
+                
+                # Extract bracketed words from definition as extra hints for context
+                bracket_hints = re.findall(r'［(.*?)］', definition)
+                if bracket_hints:
+                     hints.extend(bracket_hints)
                 
                 hint_str = ""
                 if hints:
@@ -674,6 +863,7 @@ def main():
                 
                 if not isinstance(hint_str, str):
                     hint_str = ""
+                
                 jyutping = get_cantonese(char_display, hint_str)
                 
                 if not jyutping:
