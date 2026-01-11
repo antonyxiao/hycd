@@ -13,10 +13,11 @@ import concurrent.futures
 try:
     import pycantonese
     from hanziconv import HanziConv
+    import ToJyutping
     HAS_NLP = True
 except ImportError:
     HAS_NLP = False
-    print("Warning: 'pycantonese' or 'hanziconv' not found. Jyutping generation will be limited.")
+    print("Warning: 'pycantonese', 'hanziconv', or 'ToJyutping' not found. Jyutping generation will be limited.")
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
@@ -633,8 +634,8 @@ def enrich_definition_with_jyutping(definition):
             return full_match
 
         try:
-            word_trad = HanziConv.toTraditional(word)
-            jp_list = pycantonese.characters_to_jyutping(word_trad)
+            # ToJyutping handles both simplified and traditional
+            jp_list = ToJyutping.get_jyutping_list(word)
         except:
             return full_match
             
@@ -656,9 +657,10 @@ def enrich_definition_with_jyutping(definition):
                     if len(parts) == 2:
                         target_jp = parts[1]
                     else:
-                        # Fallback to single char lookup (risky for polyphones)
-                        target_char_trad = HanziConv.toTraditional(word[1])
-                        target_jp = pycantonese.characters_to_jyutping(target_char_trad)[0][1]
+                        # Fallback to single char lookup
+                        target_jp_list = ToJyutping.get_jyutping_list(word[1])
+                        if target_jp_list:
+                            target_jp = target_jp_list[0][1]
                 
                 if target_jp:
                     return f"［{word}］（{dash}{pinyin_part}/-{target_jp}）"
@@ -674,8 +676,9 @@ def enrich_definition_with_jyutping(definition):
                     if len(parts) == 2:
                         target_jp = parts[0]
                     else:
-                        target_char_trad = HanziConv.toTraditional(word[0])
-                        target_jp = pycantonese.characters_to_jyutping(target_char_trad)[0][1]
+                        target_jp_list = ToJyutping.get_jyutping_list(word[0])
+                        if target_jp_list:
+                            target_jp = target_jp_list[0][1]
                 
                 if target_jp:
                     return f"［{word}］（{pinyin_part}/-{target_jp}{dash}）"
@@ -689,7 +692,6 @@ def get_cantonese(char_display, hint_str):
     if not HAS_NLP:
         return "", False
     primary_char = re.sub(r'（.*?）', '', char_display).strip()
-    target_char_trad = HanziConv.toTraditional(primary_char)
     
     # Try to find context-specific Jyutping from hints
     if hint_str and isinstance(hint_str, str):
@@ -697,28 +699,26 @@ def get_cantonese(char_display, hint_str):
         hints = hint_str.split(' / ')
         for hint in hints:
             if not hint: continue
+            # Handle ～ replacement
             word = hint.replace('～', primary_char)
+            # Remove any extra info in parens from the hint itself if any
             word = re.sub(r'（.*?）', '', word)
             
             try:
-                word_trad = HanziConv.toTraditional(word)
-                jp_list = pycantonese.characters_to_jyutping(word_trad)
+                # ToJyutping handles both simplified and traditional
+                jp_list = ToJyutping.get_jyutping_list(word)
                 
                 # Check the result for our target character
-                if len(word_trad) == len(jp_list):
-                    segmented = pycantonese.segment(word_trad)
-                    for ch, jp in jp_list:
-                        if ch == target_char_trad and jp:
-                            # Context match if part of a multi-char segment
-                            for seg in segmented:
-                                if target_char_trad in seg and len(seg) > 1:
-                                    return jp, True
+                for ch, jp in jp_list:
+                    if ch == primary_char and jp:
+                        # Return the first one found in a hint
+                        return jp, True
             except:
                 continue
 
-    # Fallback to single character lookup
+    # Fallback to ToJyutping for single character
     try:
-        jp_list = pycantonese.characters_to_jyutping(target_char_trad)
+        jp_list = ToJyutping.get_jyutping_list(primary_char)
         if jp_list and jp_list[0][1]:
             return jp_list[0][1], False
     except:
@@ -854,7 +854,6 @@ def main():
     print(f"Reading {INPUT_CSV} to identify necessary work...")
     
     items_for_hint_gen = []
-    items_for_jp_gen = []
     char_counters = {}
     
     # Maps for Pinyin Proxy
@@ -909,61 +908,11 @@ def main():
                         'char': char_raw,
                         'def': definition
                     })
-                
-                # 2. Identify ambiguous Jyutping
-                if card_id not in jp_cache:
-                    applicable_variants = sense_map.get(0, []) + sense_map.get(i, [])
-                    char_display = f"{base_char}（{'、'.join(applicable_variants)}）" if applicable_variants else base_char
-                    
-                    jyutping, is_context_match = get_cantonese(char_display, hint_str)
-                    
-                    # Try Mandarin mapping (kSMSZD2003Readings)
-                    m_to_c_jp = ""
-                    if not is_context_match and base_char in unihan_data and 'm_to_c' in unihan_data[base_char]:
-                        m_to_c_jp = unihan_data[base_char]['m_to_c'].get(pinyin, "")
-                        if m_to_c_jp:
-                            jyutping = m_to_c_jp
-                            # is_context_match = True # Treat as high confidence
-                    
-                    all_variants = [base_char] + (applicable_variants if applicable_variants else [])
-                    jp_candidates = []
-                    for v in all_variants:
-                        if v in unihan_data and 'jyutping_list' in unihan_data[v]:
-                            jp_candidates.extend(unihan_data[v]['jyutping_list'])
-                    jp_candidates = sorted(list(set(jp_candidates)))
-                    
-                    need_llm_jp = False
-                    if not is_context_match and not m_to_c_jp:
-                        # Ambiguous Cantonese
-                        if len(jp_candidates) > 1:
-                            need_llm_jp = True
-                        # Mandarin Polyphone
-                        elif base_char in unihan_data and len(unihan_data[base_char].get('pinlu', [])) > 1:
-                            need_llm_jp = True
-                        # No reading found
-                        elif not jyutping:
-                            need_llm_jp = True
-                    
-                    if need_llm_jp:
-                        items_for_jp_gen.append({
-                            'id': card_id,
-                            'char': base_char,
-                            'py': pinyin,
-                            'def': definition,
-                            'hints': hint_str,
-                            'candidates': jp_candidates
-                        })
-                    elif not is_context_match and m_to_c_jp:
-                        # Cache the mapping result so we don't have to recalculate in 2nd pass
-                        jp_cache[card_id] = m_to_c_jp
 
     if USE_LLM:
         if items_for_hint_gen:
             run_missing_hint_generation(items_for_hint_gen, HINT_CACHE_FILE, hint_cache)
             hint_cache = load_json_cache(HINT_CACHE_FILE)
-        if items_for_jp_gen:
-            run_jyutping_disambiguation(items_for_jp_gen, JP_CACHE_FILE, jp_cache)
-            jp_cache = load_json_cache(JP_CACHE_FILE)
         
     print(f"Generating final cards...")
     
