@@ -798,7 +798,7 @@ def parse_xhzd_definitions(def_text):
 # -----------------------------------------------------------------------------
 # TTS PROXY HELPER
 # -----------------------------------------------------------------------------
-def get_tts_proxy(pron, pron_map, char_pron_counts, freq_map):
+def get_tts_proxy(pron, pron_map, char_pron_counts, freq_map, is_cantonese=False):
     if not pron: return ""
     candidates = pron_map.get(pron)
     if not candidates:
@@ -806,9 +806,19 @@ def get_tts_proxy(pron, pron_map, char_pron_counts, freq_map):
     
     def sort_key(char):
         # 1. Monophony (False < True) -> Prefer count=1
-        count = len(char_pron_counts.get(char, set()))
-        is_poly = count > 1
-        
+        if is_cantonese and HAS_NLP:
+            try:
+                # Use ToJyutping to check strict monophony
+                res = ToJyutping.get_jyutping_candidates(char)
+                if res and res[0][1]:
+                    count = len(res[0][1])
+                else:
+                    count = 99 # Fallback if lookup fails
+            except:
+                count = len(char_pron_counts.get(char, set()))
+        else:
+            count = len(char_pron_counts.get(char, set()))
+            
         # 2. Frequency (Lower rank < Higher rank)
         f = freq_map.get(char)
         if f and f['rank'].isdigit():
@@ -816,7 +826,7 @@ def get_tts_proxy(pron, pron_map, char_pron_counts, freq_map):
         else:
             rank = 100000
             
-        return (is_poly, rank)
+        return (count, rank)
     
     sorted_cands = sorted(list(candidates), key=sort_key)
     return sorted_cands[0]
@@ -850,6 +860,25 @@ def main():
                 for j in data['jyutping_list']:
                     jp_map[j].add(char)
                     char_jp_counts[char].add(j)
+
+    # Augment Jyutping Map using ToJyutping and Frequency List
+    if HAS_NLP:
+        print("Augmenting Jyutping map with ToJyutping...")
+        # Sort freq keys by rank to prioritize common chars
+        sorted_chars = sorted(freq_map.keys(), key=lambda k: int(freq_map[k]['rank']) if freq_map[k]['rank'].isdigit() else 999999)
+        
+        # Limit to top 6000 common characters to save time
+        for char in sorted_chars[:6000]:
+            try:
+                # Use get_jyutping_candidates for all readings
+                candidates = ToJyutping.get_jyutping_candidates(char)
+                if candidates:
+                    jps = candidates[0][1]
+                    for jp in jps:
+                        jp_map[jp].add(char)
+                        char_jp_counts[char].add(jp)
+            except:
+                pass
     
     print(f"Reading {INPUT_CSV} to identify necessary work...")
     
@@ -1040,7 +1069,7 @@ def main():
                 
                 # TTS Proxies
                 py_tts = get_tts_proxy(pinyin, py_map, char_py_counts, freq_map)
-                jp_tts = get_tts_proxy(jyutping, jp_map, char_jp_counts, freq_map)
+                jp_tts = get_tts_proxy(jyutping, jp_map, char_jp_counts, freq_map, is_cantonese=True)
 
                 generated_rows.append({
                     'ID': card_id,
