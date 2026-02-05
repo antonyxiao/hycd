@@ -13,10 +13,11 @@ import concurrent.futures
 try:
     import pycantonese
     from hanziconv import HanziConv
+    import ToJyutping
     HAS_NLP = True
 except ImportError:
     HAS_NLP = False
-    print("Warning: 'pycantonese' or 'hanziconv' not found. Jyutping generation will be limited.")
+    print("Warning: 'pycantonese', 'hanziconv', or 'ToJyutping' not found. Jyutping generation will be limited.")
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
@@ -27,14 +28,26 @@ FREQ_FILE = 'CharFreq-Combined.csv'
 BAXTER_FILE = 'BaxterSagartOC2015-10-13.csv'
 TRANSLATION_CACHE_FILE = 'translation_cache.json'
 HINT_CACHE_FILE = 'hint_cache.json'
+JP_CACHE_FILE = 'jp_cache.json'
 LD_CHARSET_FILE = 'ld_charset.csv'
-UNIHAN_FILE = '/home/antony/.gemini/tmp/f9a74935d10281ca610e70c9e3ea1e0dc2d0997b73b4f242f57894b06bd629b0/Unihan_Readings.txt'
+UNIHAN_FILE = 'Unihan_Readings.txt'
 OUTPUT_CSV = 'hanzi_cards_complete.csv'
 PINYIN_SUGGESTIONS_FILE = 'pinyin_suggestions.txt'
 
+def load_env_key():
+    try:
+        if os.path.exists('.env'):
+            with open('.env', 'r') as f:
+                for line in f:
+                    if line.startswith('OPENROUTER_API_KEY='):
+                        return line.split('=', 1)[1].strip()
+    except Exception as e:
+        print(f"Error loading .env: {e}")
+    return ""
+
 # LLM Config
-OPENROUTER_API_KEY = "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"
-USE_LLM = False 
+OPENROUTER_API_KEY = load_env_key()
+USE_LLM = True 
 
 # -----------------------------------------------------------------------------
 # DATA LOADING
@@ -127,6 +140,7 @@ def load_unihan_data(filepath):
                 if field == 'kTang':
                     data[char]['mc'] = value
                 elif field == 'kCantonese':
+                    data[char]['jyutping_list'] = value.split()
                     data[char]['jyutping'] = value.split()[0]
                 elif field == 'kHangul':
                     # Clean up: "온:N 은:N" -> "온 / 은"
@@ -135,6 +149,19 @@ def load_unihan_data(filepath):
                         v = v.split(':')[0]
                         cleaned_values.append(v)
                     data[char]['hangul'] = " / ".join(cleaned_values)
+                elif field == 'kHanyuPinlu':
+                    # e.g. zhǎng(1879) cháng(1179)
+                    readings = re.findall(r'([a-zA-Züvāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]+)\(\d+\)', value)
+                    data[char]['pinlu'] = readings
+                elif field == 'kSMSZD2003Readings':
+                    # e.g. cháng粵coeng4 zhàng粵zoeng6
+                    mapping = {}
+                    pairs = value.split()
+                    for pair in pairs:
+                        if '粵' in pair:
+                            m_py, c_jp = pair.split('粵')
+                            mapping[m_py] = c_jp
+                    data[char]['m_to_c'] = mapping
             except ValueError:
                 continue
     return data
@@ -502,6 +529,93 @@ def get_middle_chinese(candidates, pinyin, english_keywords, baxter_data):
     winners = sorted(list(set([mc for score, mc in possible_mcs if score == best_score])))
     return " / ".join(winners)
 
+def disambiguate_jyutping_batch(batch_items, batch_id):
+    """
+    batch_items: list of {'id': ..., 'char': ..., 'py': ..., 'def': ..., 'hints': ..., 'candidates': [...]}
+    """
+    prompt = f"""
+    For each Chinese character entry below, select the single most appropriate Cantonese Jyutping reading.
+    
+    CRITICAL:
+    1. If the character has multiple readings (polyphones), choose the one that matches the specific definition and examples.
+    2. Example '生': 'sang1' is often used for 'living/born', while 'saang1' is often used for 'unripe/raw/student'.
+    3. Example '长': 'coeng4' matches 'cháng' (long), 'zoeng2' matches 'zhǎng' (grow/elder).
+    4. If the provided 'candidates' list is missing the correct reading, you MUST provide the correct one anyway.
+    
+    Return ONLY a JSON object where keys are the 'id' and values are the single selected Jyutping string (e.g. "zoeng2").
+
+    Entries:
+    {json.dumps(batch_items, ensure_ascii=False)}
+    """
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "deepseek/deepseek-v3.2",
+        "messages": [
+            {"role": "system", "content": "You are a world-class Cantonese linguistics expert. You provide accurate Jyutping based on semantic context. Respond with valid JSON only."},
+            {"role": "user", "content": prompt}
+        ],
+        "response_format": {"type": "json_object"}
+    }
+
+    print(f"    [JP Batch {batch_id}] Sending request...")
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=60
+        )
+        if response.status_code != 200:
+            print(f"    [JP Batch {batch_id}] API Error {response.status_code}")
+            return {}
+        
+        raw_content = response.json()['choices'][0]['message']['content']
+        clean_content = re.sub(r'^```json\s*|\s*```$', '', raw_content.strip(), flags=re.MULTILINE)
+        return json.loads(clean_content)
+    except Exception as e:
+        print(f"    [JP Batch {batch_id}] Error: {e}")
+        return {}
+
+def run_jyutping_disambiguation(missing_items, cache_file, cache_data):
+    if not missing_items:
+        return
+
+    BATCH_SIZE = 20
+    MAX_WORKERS = 20
+    
+    batches = [missing_items[i:i + BATCH_SIZE] for i in range(0, len(missing_items), BATCH_SIZE)]
+    print(f"Disambiguating Jyutping for {len(missing_items)} items in {len(batches)} batches...")
+    
+    lock = threading.Lock()
+    
+    def process_batch(batch, idx):
+        results = disambiguate_jyutping_batch(batch, idx+1)
+        if results:
+            with lock:
+                # Basic validation: ensure the result is one of the candidates if candidates were provided
+                valid_results = {}
+                batch_map = {item['id']: item['candidates'] for item in batch}
+                for rid, jp in results.items():
+                    if rid in batch_map:
+                        candidates = batch_map[rid]
+                        if not candidates or jp in candidates:
+                            valid_results[rid] = jp
+                        else:
+                            # If LLM gave something else, find closest or just take it if candidates were empty
+                            valid_results[rid] = jp
+                
+                cache_data.update(valid_results)
+                save_json_cache(cache_data, cache_file)
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(process_batch, b, i) for i, b in enumerate(batches)]
+        concurrent.futures.wait(futures)
+
 def enrich_definition_with_jyutping(definition):
     """
     Searches for words in brackets ［word］ followed by pinyin guides （guide）.
@@ -516,58 +630,68 @@ def enrich_definition_with_jyutping(definition):
         word = match.group(1)
         guide = match.group(2)
         
-        # Avoid processing if it already has jyutping
         if '/-' in guide:
             return full_match
 
-        # Try to convert word to traditional for lookup
         try:
-            word_trad = HanziConv.toTraditional(word)
-            jp_list = pycantonese.characters_to_jyutping(word_trad)
-            # jp_list is list of (char, jyutping)
+            # ToJyutping handles both simplified and traditional
+            jp_list = ToJyutping.get_jyutping_list(word)
         except:
             return full_match
             
-        if len(jp_list) != len(word):
-            return full_match
-            
-        # Detect dash used
-        dash = '–' if '–' in guide else '-' # Prefer em dash if present
+        dash = '–' if '–' in guide else '-' 
         if dash not in guide:
-            # If no dash, it might be a full pronunciation guide or something else.
-            # We skip complex logic for no-dash cases to avoid errors.
             return full_match
             
-        # Assume 2-char word for heuristics as it covers most cases like 驵侩, 舴艋
         if len(word) == 2:
             if guide.startswith(dash):
-                # Format: –pinyin (Head is 1st char, pinyin is for 2nd char)
                 pinyin_part = guide[len(dash):].strip()
-                # Target char is the second one (index 1)
-                target_jp = jp_list[1][1]
+                # Target is 2nd char
+                target_jp = ""
+                if len(jp_list) == 2:
+                    target_jp = jp_list[1][1]
+                elif len(jp_list) == 1:
+                    # Combined case: ('傾軋', 'king1aat3')
+                    full_jp = jp_list[0][1]
+                    parts = re.findall(r'[a-z]+[1-6]', full_jp)
+                    if len(parts) == 2:
+                        target_jp = parts[1]
+                    else:
+                        # Fallback to single char lookup
+                        target_jp_list = ToJyutping.get_jyutping_list(word[1])
+                        if target_jp_list:
+                            target_jp = target_jp_list[0][1]
+                
                 if target_jp:
-                    new_guide = f"{dash}{pinyin_part}/-{target_jp}"
-                    return f"［{word}］（{new_guide}）"
+                    return f"［{word}］（{dash}{pinyin_part}/-{target_jp}）"
             elif guide.endswith(dash):
-                # Format: pinyin– (Pinyin is for 1st char, Head is 2nd char)
                 pinyin_part = guide[:-len(dash)].strip()
-                # Target char is the first one (index 0)
-                target_jp = jp_list[0][1]
+                # Target is 1st char
+                target_jp = ""
+                if len(jp_list) == 2:
+                    target_jp = jp_list[0][1]
+                elif len(jp_list) == 1:
+                    full_jp = jp_list[0][1]
+                    parts = re.findall(r'[a-z]+[1-6]', full_jp)
+                    if len(parts) == 2:
+                        target_jp = parts[0]
+                    else:
+                        target_jp_list = ToJyutping.get_jyutping_list(word[0])
+                        if target_jp_list:
+                            target_jp = target_jp_list[0][1]
+                
                 if target_jp:
-                    new_guide = f"{pinyin_part}/-{target_jp}{dash}"
-                    return f"［{word}］（{new_guide}）"
+                    return f"［{word}］（{pinyin_part}/-{target_jp}{dash}）"
         
         return full_match
 
-    # Pattern: ［word］（guide）
     new_def = re.sub(r'［(.*?)］（(.*?)）', replacer, definition)
     return new_def
 
 def get_cantonese(char_display, hint_str):
     if not HAS_NLP:
-        return ""
+        return "", False
     primary_char = re.sub(r'（.*?）', '', char_display).strip()
-    target_char_trad = HanziConv.toTraditional(primary_char)
     
     # Try to find context-specific Jyutping from hints
     if hint_str and isinstance(hint_str, str):
@@ -575,28 +699,31 @@ def get_cantonese(char_display, hint_str):
         hints = hint_str.split(' / ')
         for hint in hints:
             if not hint: continue
+            # Handle ～ replacement
             word = hint.replace('～', primary_char)
+            # Remove any extra info in parens from the hint itself if any
             word = re.sub(r'（.*?）', '', word)
             
             try:
-                word_trad = HanziConv.toTraditional(word)
-                jp_list = pycantonese.characters_to_jyutping(word_trad)
+                # ToJyutping handles both simplified and traditional
+                jp_list = ToJyutping.get_jyutping_list(word)
                 
                 # Check the result for our target character
                 for ch, jp in jp_list:
-                    if ch == target_char_trad and jp:
-                        return jp # Return the first valid context match
+                    if ch == primary_char and jp:
+                        # Return the first one found in a hint
+                        return jp, True
             except:
                 continue
 
-    # Fallback to single character lookup
+    # Fallback to ToJyutping for single character
     try:
-        jp_list = pycantonese.characters_to_jyutping(target_char_trad)
+        jp_list = ToJyutping.get_jyutping_list(primary_char)
         if jp_list and jp_list[0][1]:
-            return jp_list[0][1]
+            return jp_list[0][1], False
     except:
         pass
-    return ""
+    return "", False
 
 def parse_complex_variants(char_raw):
     CIRCLE_MAP = {c: i+1 for i, c in enumerate("①②③④⑤⑥⑦⑧⑨⑩")}
@@ -633,7 +760,7 @@ def parse_complex_variants(char_raw):
     return sense_map, base_char
 
 def parse_xhzd_definitions(def_text):
-    def_text = re.sub(r'([❶-❿])', r'\n\1', def_text)
+    def_text = re.sub(r'([❶-❿⓫-⓴])', r'\n\1', def_text)
     lines = def_text.split('\n')
     parsed_defs = []
     current_def = ""
@@ -642,7 +769,7 @@ def parse_xhzd_definitions(def_text):
     for line in lines:
         line = line.strip()
         if not line: continue
-        is_new_def = re.match(r'^[❶-❿0-9]\.?', line)
+        is_new_def = re.match(r'^[❶-❿⓫-⓴0-9]\.?', line)
         if (line.startswith('［') or line.startswith('[')) and (parsed_defs or current_def):
              continue
         if is_new_def or (not parsed_defs and not current_def):
@@ -650,7 +777,7 @@ def parse_xhzd_definitions(def_text):
                 parsed_defs.append({'def': current_def, 'hints': current_hints})
                 current_def = ""
                 current_hints = []
-            clean_line = re.sub(r'^[❶-❿0-9]\.?\s*', '', line)
+            clean_line = re.sub(r'^[❶-❿⓫-⓴0-9]\.?\s*', '', line)
             parts = clean_line.split('：', 1)
             valid_split = False
             if len(parts) == 2:
@@ -671,7 +798,7 @@ def parse_xhzd_definitions(def_text):
 # -----------------------------------------------------------------------------
 # TTS PROXY HELPER
 # -----------------------------------------------------------------------------
-def get_tts_proxy(pron, pron_map, char_pron_counts, freq_map):
+def get_tts_proxy(pron, pron_map, char_pron_counts, freq_map, is_cantonese=False):
     if not pron: return ""
     candidates = pron_map.get(pron)
     if not candidates:
@@ -679,9 +806,19 @@ def get_tts_proxy(pron, pron_map, char_pron_counts, freq_map):
     
     def sort_key(char):
         # 1. Monophony (False < True) -> Prefer count=1
-        count = len(char_pron_counts.get(char, set()))
-        is_poly = count > 1
-        
+        if is_cantonese and HAS_NLP:
+            try:
+                # Use ToJyutping to check strict monophony
+                res = ToJyutping.get_jyutping_candidates(char)
+                if res and res[0][1]:
+                    count = len(res[0][1])
+                else:
+                    count = 99 # Fallback if lookup fails
+            except:
+                count = len(char_pron_counts.get(char, set()))
+        else:
+            count = len(char_pron_counts.get(char, set()))
+            
         # 2. Frequency (Lower rank < Higher rank)
         f = freq_map.get(char)
         if f and f['rank'].isdigit():
@@ -689,7 +826,7 @@ def get_tts_proxy(pron, pron_map, char_pron_counts, freq_map):
         else:
             rank = 100000
             
-        return (is_poly, rank)
+        return (count, rank)
     
     sorted_cands = sorted(list(candidates), key=sort_key)
     return sorted_cands[0]
@@ -704,6 +841,7 @@ def main():
     cedict_data, cedict_reverse = parse_cedict(CEDICT_FILE)
     trans_cache = load_json_cache(TRANSLATION_CACHE_FILE)
     hint_cache = load_json_cache(HINT_CACHE_FILE)
+    jp_cache = load_json_cache(JP_CACHE_FILE)
     unihan_data = load_unihan_data(UNIHAN_FILE)
     
     # Load Pinyin Corrections
@@ -718,6 +856,29 @@ def main():
             jp = data['jyutping']
             jp_map[jp].add(char)
             char_jp_counts[char].add(jp)
+            if 'jyutping_list' in data:
+                for j in data['jyutping_list']:
+                    jp_map[j].add(char)
+                    char_jp_counts[char].add(j)
+
+    # Augment Jyutping Map using ToJyutping and Frequency List
+    if HAS_NLP:
+        print("Augmenting Jyutping map with ToJyutping...")
+        # Sort freq keys by rank to prioritize common chars
+        sorted_chars = sorted(freq_map.keys(), key=lambda k: int(freq_map[k]['rank']) if freq_map[k]['rank'].isdigit() else 999999)
+        
+        # Limit to top 6000 common characters to save time
+        for char in sorted_chars[:6000]:
+            try:
+                # Use get_jyutping_candidates for all readings
+                candidates = ToJyutping.get_jyutping_candidates(char)
+                if candidates:
+                    jps = candidates[0][1]
+                    for jp in jps:
+                        jp_map[jp].add(char)
+                        char_jp_counts[char].add(jp)
+            except:
+                pass
     
     print(f"Reading {INPUT_CSV} to identify necessary work...")
     
@@ -744,11 +905,7 @@ def main():
             if char_raw == '字头' or (char_raw == '吖' and '释文' in row[6]):
                 continue
             
-            match = re.search(r'^(.*?)（(.*?)）$', char_raw)
-            if match:
-                base_char = match.group(1)
-            else:
-                base_char = char_raw
+            sense_map, base_char = parse_complex_variants(char_raw)
             
             if pinyin:
                 py_map[pinyin].add(base_char)
@@ -757,27 +914,34 @@ def main():
             raw_def = row[6]
             senses = parse_xhzd_definitions(raw_def)
             
-            for sense in senses:
+            for i, sense in enumerate(senses, 1):
                 if char_raw not in char_counters: char_counters[char_raw] = 0
                 char_counters[char_raw] += 1
                 
                 clean_id_base = char_raw.replace('（', '_').replace('）', '')
                 card_id = f"{clean_id_base}_{char_counters[char_raw]}"
                 
-                hints = sense['hints']
                 definition = sense['def'].strip().rstrip('；').strip()
                 definition = re.sub(r'另见.*?(?:。|；|$)', '', definition).strip()
+                
+                hints = sense['hints']
+                # Extract bracketed words from definition as extra hints for context
+                bracket_hints = re.findall(r'［(.*?)］', definition)
+                all_hints_list = hints + bracket_hints
+                hint_str = " / ".join(all_hints_list) if all_hints_list else ""
 
+                # 1. Identify missing hints
                 if not hints and card_id not in hint_cache:
                     items_for_hint_gen.append({
                         'id': card_id,
                         'char': char_raw,
                         'def': definition
                     })
-    
-    if USE_LLM and items_for_hint_gen:
-        # run_missing_hint_generation(items_for_hint_gen, HINT_CACHE_FILE, hint_cache)
-        hint_cache = load_json_cache(HINT_CACHE_FILE)
+
+    if USE_LLM:
+        if items_for_hint_gen:
+            run_missing_hint_generation(items_for_hint_gen, HINT_CACHE_FILE, hint_cache)
+            hint_cache = load_json_cache(HINT_CACHE_FILE)
         
     print(f"Generating final cards...")
     
@@ -821,15 +985,16 @@ def main():
                 definition = enrich_definition_with_jyutping(definition)
                 
                 hints = sense['hints']
+                # Enrich hints as well
+                hints = [enrich_definition_with_jyutping(h) for h in hints]
                 
                 # Extract bracketed words from definition as extra hints for context
                 bracket_hints = re.findall(r'［(.*?)］', definition)
-                if bracket_hints:
-                     hints.extend(bracket_hints)
+                all_hints_list = hints + bracket_hints
                 
                 hint_str = ""
-                if hints:
-                    cleaned_hints = [re.sub(r'另见.*', '', h).strip() for h in hints]
+                if all_hints_list:
+                    cleaned_hints = [re.sub(r'另见.*', '', h).strip() for h in all_hints_list]
                     cleaned_hints = [h for h in cleaned_hints if h]
                     hint_str = " / ".join(cleaned_hints)
                 elif card_id in hint_cache:
@@ -838,8 +1003,6 @@ def main():
                         hint_str = val
                     elif isinstance(val, dict):
                         hint_str = val.get('hint') or val.get('hints') or ""
-                        if not isinstance(hint_str, str):
-                            hint_str = ""
                 
                 if hint_str:
                     hint_str = re.sub(r'另见.*', '', hint_str).strip()
@@ -861,16 +1024,21 @@ def main():
                 if not isinstance(final_eng, str):
                     final_eng = ""
                 
-                if not isinstance(hint_str, str):
-                    hint_str = ""
+                # Get Jyutping
+                jyutping = ""
+                if card_id in jp_cache:
+                    jyutping = jp_cache[card_id]
+                else:
+                    jyutping, _ = get_cantonese(char_display, hint_str)
+                    if not jyutping:
+                        for v in all_variants_for_mc:
+                            if v in unihan_data and 'jyutping' in unihan_data[v]:
+                                jyutping = unihan_data[v]['jyutping']
+                                break
                 
-                jyutping = get_cantonese(char_display, hint_str)
-                
-                if not jyutping:
-                    for v in all_variants_for_mc:
-                        if v in unihan_data and 'jyutping' in unihan_data[v]:
-                            jyutping = unihan_data[v]['jyutping']
-                            break
+                # Safety: stick with only 1 reading for now
+                if jyutping and isinstance(jyutping, str):
+                    jyutping = jyutping.split(',')[0].strip()
                 
                 eng_text_for_mc = final_eng
                 eng_keywords = set()
@@ -901,7 +1069,7 @@ def main():
                 
                 # TTS Proxies
                 py_tts = get_tts_proxy(pinyin, py_map, char_py_counts, freq_map)
-                jp_tts = get_tts_proxy(jyutping, jp_map, char_jp_counts, freq_map)
+                jp_tts = get_tts_proxy(jyutping, jp_map, char_jp_counts, freq_map, is_cantonese=True)
 
                 generated_rows.append({
                     'ID': card_id,
@@ -918,6 +1086,9 @@ def main():
                     'Frequency': freq_info['rank'],
                     'Level': level
                 })
+
+    if USE_LLM and jp_cache:
+        save_json_cache(jp_cache, JP_CACHE_FILE)
 
     print(f"Saving {len(generated_rows)} cards to {OUTPUT_CSV}...")
     headers = [
